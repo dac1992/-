@@ -1,0 +1,6 @@
+{
+  "name": "网页源码克隆与下载工具",
+  "description": "输入目标网址获取完整的网页源码及静态资源，支持在线预览和一键下载本地离线包。",
+  "requestFramePermissions": [],
+  "majorCapabilities": ["MAJOR_CAPABILITY_SERVER_SIDE_GEMINI_API"]
+}
