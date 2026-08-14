@@ -28,7 +28,7 @@ function getUrlVariations(urlStr: string): string[] {
 
     const u = new URL(norm);
     
-    // Trailing slash variant
+    // 1. Trailing slash variant
     if (u.pathname.endsWith('/')) {
       const noSlash = new URL(norm);
       noSlash.pathname = noSlash.pathname.slice(0, -1);
@@ -39,20 +39,55 @@ function getUrlVariations(urlStr: string): string[] {
       vars.push(withSlash.href);
     }
 
-    // Protocol swap variant (http <-> https)
+    // 2. Protocol swap variant (http <-> https)
     const altProto = new URL(norm);
     altProto.protocol = altProto.protocol === 'https:' ? 'http:' : 'https:';
     vars.push(altProto.href);
 
-    // Pathname only
+    // 3. WWW swap variant (www.domain.com <-> domain.com)
+    if (u.hostname.startsWith('www.')) {
+      const noWww = new URL(norm);
+      noWww.hostname = noWww.hostname.substring(4);
+      vars.push(noWww.href);
+      const noWwwAlt = new URL(altProto.href);
+      noWwwAlt.hostname = noWwwAlt.hostname.substring(4);
+      vars.push(noWwwAlt.href);
+    } else {
+      const withWww = new URL(norm);
+      withWww.hostname = 'www.' + withWww.hostname;
+      vars.push(withWww.href);
+      const withWwwAlt = new URL(altProto.href);
+      withWwwAlt.hostname = 'www.' + withWwwAlt.hostname;
+      vars.push(withWwwAlt.href);
+    }
+
+    // 4. Pathname & Lowercase Pathname
     vars.push(u.pathname);
+    vars.push(u.pathname.toLowerCase());
     if (u.pathname.endsWith('/')) {
       vars.push(u.pathname.slice(0, -1));
+      vars.push(u.pathname.slice(0, -1).toLowerCase());
+    }
+
+    // 5. Index aliases
+    if (u.pathname.endsWith('/index.html') || u.pathname.endsWith('/index.htm') || u.pathname.endsWith('/index.php')) {
+      const dirPath = u.pathname.substring(0, u.pathname.lastIndexOf('/') + 1);
+      vars.push(dirPath);
+      vars.push(dirPath.slice(0, -1));
+    } else if (u.pathname === '/' || u.pathname === '') {
+      vars.push('/index.html');
+      vars.push('/index.htm');
+    }
+
+    // 6. Pathname + Search
+    if (u.search) {
+      vars.push(u.pathname + u.search);
+      vars.push((u.pathname + u.search).toLowerCase());
     }
   } catch {
     vars.push(urlStr);
   }
-  return Array.from(new Set(vars));
+  return Array.from(new Set(vars.filter(Boolean)));
 }
 
 // Extract root domain for cross-subdomain matching (e.g. www.site.com -> site.com, blog.site.com -> site.com)
@@ -78,28 +113,74 @@ function isSameDomain(urlA: string, urlB: string): boolean {
 }
 
 // Score URLs to prioritize article/detail pages over generic menu/footer noise
-function getLinkPriorityScore(urlStr: string): number {
+function getLinkPriorityScore(urlStr: string, parentUrlStr?: string): number {
   try {
     const u = new URL(urlStr);
     const path = u.pathname.toLowerCase();
     const search = u.search.toLowerCase();
+    let score = 20;
 
-    // High priority: Article detail pages (.html, /detail/, /article/, /show/, /view/, /p/, ?id=, ?p=)
-    if (/\d+\.html$/i.test(path) || /\/\d+$/i.test(path) || path.includes('/detail') || path.includes('/article') || path.includes('/show/') || path.includes('/view/') || path.includes('/content/') || search.includes('id=') || search.includes('p=')) {
-      return 100;
+    // Boost if parent was a list/category page
+    if (parentUrlStr) {
+      const pPath = new URL(parentUrlStr).pathname.toLowerCase();
+      if (pPath.includes('/list') || pPath.includes('/cat') || pPath.includes('/news') || pPath.includes('/product') || pPath.includes('/article') || pPath.includes('/cases')) {
+        score += 40;
+      }
     }
 
-    // Medium priority: Categories and lists
-    if (path.includes('/list') || path.includes('/cat') || path.includes('/shiti') || path.includes('/honor') || path.includes('/certificate') || path.includes('/news') || path.includes('/column')) {
-      return 50;
+    // Super High Priority (+120): Article/product/case detail pages (.html with ID, /detail/, /show/, /view/, etc.)
+    if (
+      /\d+\.(?:html|htm|shtml|php|jsp|asp|aspx)$/i.test(path) ||
+      /\/(?:show|detail|view|read|article|post|p|item|info|cases|product)[\-_/]\d+/i.test(path) ||
+      /\/\d+$/i.test(path) ||
+      path.includes('/detail') ||
+      path.includes('/article') ||
+      path.includes('/show/') ||
+      path.includes('/view/') ||
+      path.includes('/content/') ||
+      path.includes('/post/') ||
+      path.includes('/item/') ||
+      search.includes('id=') ||
+      search.includes('aid=') ||
+      search.includes('article_id=') ||
+      search.includes('p=') ||
+      search.includes('newsid=') ||
+      search.includes('infoid=')
+    ) {
+      return score + 120;
     }
 
-    // Low priority: Auth, cart, user profile
-    if (path.includes('login') || path.includes('register') || path.includes('member') || path.includes('user') || path.includes('cart')) {
-      return -50;
+    // Medium Priority (+60): Categories and lists
+    if (
+      path.includes('/list') ||
+      path.includes('/cat') ||
+      path.includes('/category') ||
+      path.includes('/shiti') ||
+      path.includes('/honor') ||
+      path.includes('/certificate') ||
+      path.includes('/news') ||
+      path.includes('/column') ||
+      path.includes('/products') ||
+      path.includes('/cases')
+    ) {
+      return score + 60;
     }
 
-    return 10;
+    // Low priority (-40): Auth, cart, user profile, terms
+    if (
+      path.includes('login') ||
+      path.includes('register') ||
+      path.includes('member') ||
+      path.includes('user') ||
+      path.includes('cart') ||
+      path.includes('privacy') ||
+      path.includes('terms') ||
+      path.includes('sitemap')
+    ) {
+      return -40;
+    }
+
+    return score;
   } catch {
     return 0;
   }
@@ -320,8 +401,8 @@ export async function processWebsiteCloning(options: CloneOptions): Promise<Clon
   }
 
   const selectedUserAgent = options.userAgent === 'mobile' ? MOBILE_USER_AGENT : DEFAULT_USER_AGENT;
-  const crawlDepth = Math.min(Math.max(options.crawlDepth || 3, 1), 5); // 1 to 5 depth
-  const maxPages = Math.min(Math.max(options.maxPages || 20, 1), 100); // 1 to 100 pages
+  const crawlDepth = Math.min(Math.max(options.crawlDepth || 5, 1), 5); // Default to 5 depth (1 to 5)
+  const maxPages = Math.min(Math.max(options.maxPages || 50, 1), 150); // 1 to 150 pages (default 50)
 
   // Global time deadline safety: default 35 seconds to guarantee response before proxy 60s timeout
   const globalTimeoutMs = Math.min(options.timeoutMs || 35000, 45000);
@@ -363,16 +444,60 @@ export async function processWebsiteCloning(options: CloneOptions): Promise<Clon
       ...getUrlVariations(page.finalUrl)
     ];
     for (const v of vars) {
-      downloadedPagesMap.set(v, page);
+      if (v) downloadedPagesMap.set(v, page);
     }
   };
 
   const findDownloadedPage = (urlStr: string): ProcessedPage | undefined => {
+    if (!urlStr) return undefined;
     if (downloadedPagesMap.has(urlStr)) return downloadedPagesMap.get(urlStr);
+    
     const vars = getUrlVariations(urlStr);
     for (const v of vars) {
       if (downloadedPagesMap.has(v)) return downloadedPagesMap.get(v);
     }
+
+    // Fallback: match by pathname + search on same root domain
+    try {
+      let targetU: URL;
+      if (urlStr.startsWith('http://') || urlStr.startsWith('https://')) {
+        targetU = new URL(urlStr);
+      } else {
+        targetU = new URL(urlStr, targetUrl.href);
+      }
+
+      const targetPath = targetU.pathname.toLowerCase();
+      const targetSearch = targetU.search.toLowerCase();
+      
+      for (const page of uniqueDownloadedPagesSet) {
+        try {
+          const pageU = new URL(page.finalUrl || page.url);
+          if (isSameDomain(pageU.href, targetU.href)) {
+            const pPath = pageU.pathname.toLowerCase();
+            const pSearch = pageU.search.toLowerCase();
+            
+            // Match same path and query
+            if (pPath === targetPath && (!targetSearch || pSearch === targetSearch)) {
+              return page;
+            }
+
+            // Match path ignoring trailing slash or index.html
+            const cleanPPath = pPath.replace(/\/index\.(?:html|htm|php)$/, '').replace(/\/+$/, '');
+            const cleanTPath = targetPath.replace(/\/index\.(?:html|htm|php)$/, '').replace(/\/+$/, '');
+            if (cleanPPath && cleanPPath === cleanTPath) {
+              return page;
+            }
+
+            // Match root index aliases
+            if ((pPath === '/' || pPath === '/index.html' || pPath === '/index.htm') &&
+                (targetPath === '/' || targetPath === '/index.html' || targetPath === '/index.htm')) {
+              return page;
+            }
+          }
+        } catch {}
+      }
+    } catch {}
+
     return undefined;
   };
 
@@ -570,26 +695,26 @@ export async function processWebsiteCloning(options: CloneOptions): Promise<Clon
 
       addLog('success', `成功离线保存页面 [${pageTitle.substring(0, 22)}] -> ${localPath}`);
 
-      // Discover subpage links if depth permits
-      if (current.depth < crawlDepth && uniqueDownloadedPagesSet.size + pageQueue.length < maxPages && Date.now() < globalDeadline) {
+      // Discover subpage links if depth permits (buffer pool up to 800 candidates)
+      if (current.depth < crawlDepth && Date.now() < globalDeadline && pageQueue.length < 800) {
         let discoveredInThisPage = 0;
         
-        // Scan standard a[href], data-href, data-url, area[href], and onclick strings
-        const candidateElements = $('a[href], a[data-href], a[data-url], a[data-link], area[href], [onclick]');
+        // Scan standard a[href], data-href, data-url, data-link, data-target, area[href], and onclick strings
+        const candidateElements = $('a[href], a[data-href], a[data-url], a[data-link], a[data-target], area[href], [data-url], [data-href], [onclick]');
 
         candidateElements.each((_, el) => {
           const $el = $(el);
-          let rawUrls: string[] = [];
+          const rawUrls: string[] = [];
 
-          const href = $el.attr('href') || $el.attr('data-href') || $el.attr('data-url') || $el.attr('data-link');
-          if (href && !href.startsWith('javascript:') && !href.startsWith('#')) {
+          const href = $el.attr('href') || $el.attr('data-href') || $el.attr('data-url') || $el.attr('data-link') || $el.attr('data-target');
+          if (href && !href.startsWith('javascript:') && !href.startsWith('#') && !href.startsWith('mailto:') && !href.startsWith('tel:')) {
             rawUrls.push(href);
           }
 
           const onclick = $el.attr('onclick');
           if (onclick) {
-            const match = onclick.match(/(?:location\.href|window\.open)\s*=\s*['"]([^'"]+)['"]/i) ||
-                          onclick.match(/(?:location\.href|window\.open)\s*\(\s*['"]([^'"]+)['"]/i);
+            const match = onclick.match(/(?:location\.href|location\.assign|window\.open|window\.location|goTo|openUrl|toDetail)\s*=\s*['"]([^'"]+)['"]/i) ||
+                          onclick.match(/(?:location\.href|location\.assign|window\.open|window\.location|goTo|openUrl|toDetail)\s*\(\s*['"]([^'"]+)['"]/i);
             if (match && match[1]) {
               rawUrls.push(match[1]);
             }
@@ -604,11 +729,11 @@ export async function processWebsiteCloning(options: CloneOptions): Promise<Clon
               if (
                 isEligibleSubpageLink(normUrl, targetUrl) &&
                 !variations.some(v => visitedUrls.has(v)) &&
-                uniqueDownloadedPagesSet.size + pageQueue.length < maxPages
+                pageQueue.length < 800
               ) {
                 variations.forEach(v => visitedUrls.add(v));
                 
-                const score = getLinkPriorityScore(normUrl);
+                const score = getLinkPriorityScore(normUrl, current.url);
                 pageQueue.push({ url: normUrl, depth: current.depth + 1, priority: score });
                 discoveredInThisPage++;
               }
@@ -619,7 +744,7 @@ export async function processWebsiteCloning(options: CloneOptions): Promise<Clon
         });
 
         if (discoveredInThisPage > 0) {
-          addLog('info', `在页面 [${pageTitle.substring(0, 15)}] 中识别到 ${discoveredInThisPage} 个下级页面链接`);
+          addLog('info', `在页面 [${pageTitle.substring(0, 15)}] 中识别到 ${discoveredInThisPage} 个下级页面链接 (待下载队列: ${pageQueue.length})`);
         }
       }
     } catch (err: any) {

@@ -23,8 +23,8 @@ export const UrlInputBar: React.FC<UrlInputBarProps> = ({ onStartClone, isLoadin
   const [downloadCss, setDownloadCss] = useState(true);
   const [downloadJs, setDownloadJs] = useState(true);
   const [downloadImages, setDownloadImages] = useState(true);
-  const [crawlDepth, setCrawlDepth] = useState<number>(3); // Default to 3 depth for articles & inner pages
-  const [maxPages, setMaxPages] = useState<number>(20); // Default 20 pages
+  const [crawlDepth, setCrawlDepth] = useState<number>(5); // Default to 5 depth for recursive multi-level pages
+  const [maxPages, setMaxPages] = useState<number>(50); // Default 50 pages for lists & details
 
   const handleSubmit = (e: React.FormEvent) => {
     e.preventDefault();

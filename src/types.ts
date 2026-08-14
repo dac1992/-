@@ -12,7 +12,7 @@ export interface CloneOptions {
   maxAssetSizeMb?: number;
   addBaseTag?: boolean;
   cleanScripts?: boolean;
-  crawlDepth?: number; // 1 = 仅首页, 2 = 包含直接内页, 3 = 深度内页
+  crawlDepth?: number; // 默认 5 层 (1 = 仅首页, 2 = 包含直接内页, 3-5 = 深度递归内页)
   maxPages?: number; // 最大抓取页面数
 }
 
