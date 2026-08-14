@@ -107,7 +107,10 @@ function getLinkPriorityScore(urlStr: string): number {
 
 // Calculate relative path between two local zip file paths
 function getRelativePath(fromPath: string, toPath: string): string {
-  if (fromPath === toPath) return '#';
+  if (fromPath === toPath) {
+    const fileName = toPath.split('/').pop() || 'index.html';
+    return './' + fileName;
+  }
   const fromParts = fromPath.split('/');
   fromParts.pop(); // Remove filename to get directory
   const toParts = toPath.split('/');
@@ -124,23 +127,145 @@ function getRelativePath(fromPath: string, toPath: string): string {
   return (upStr + downStr).replace(/^\.\/\.\//, './');
 }
 
-// Extract url(...) references from CSS or style attributes
-function extractUrlsFromCssText(cssText: string, cssBaseUrl: string): { raw: string; abs: string }[] {
-  const results: { raw: string; abs: string }[] = [];
-  const regex = /url\s*\(\s*['"]?([^'"\)\s]+)['"]?\s*\)/gi;
-  let match;
-  while ((match = regex.exec(cssText)) !== null) {
-    const rawUrl = match[1];
-    if (rawUrl && !rawUrl.startsWith('data:') && !rawUrl.startsWith('about:') && !rawUrl.startsWith('#')) {
-      try {
-        const abs = new URL(rawUrl, cssBaseUrl).href;
-        results.push({ raw: rawUrl, abs });
-      } catch {
-        // Invalid URL
+// Clean raw CSS url string by stripping HTML entities, outer quotes, and extra whitespace
+function cleanCssUrlString(raw: string): string {
+  if (!raw) return '';
+  let s = raw.trim();
+  s = s.replace(/&quot;/g, '"').replace(/&#39;/g, "'").replace(/&amp;/g, '&');
+  s = s.replace(/^['"]+|['"]+$/g, '').trim();
+  return s;
+}
+
+// Determine asset type by extension
+function getAssetTypeFromUrl(urlStr: string): 'css' | 'image' | 'font' | 'js' | 'other' {
+  try {
+    const pathname = new URL(urlStr).pathname.toLowerCase();
+    if (pathname.endsWith('.css')) return 'css';
+    if (pathname.endsWith('.js')) return 'js';
+    if (pathname.endsWith('.woff') || pathname.endsWith('.woff2') || pathname.endsWith('.ttf') || pathname.endsWith('.eot') || pathname.endsWith('.otf')) return 'font';
+    if (pathname.endsWith('.png') || pathname.endsWith('.jpg') || pathname.endsWith('.jpeg') || pathname.endsWith('.gif') || pathname.endsWith('.svg') || pathname.endsWith('.webp') || pathname.endsWith('.bmp') || pathname.endsWith('.ico') || pathname.endsWith('.avif')) return 'image';
+  } catch {}
+  return 'image';
+}
+
+interface CssUrlReference {
+  raw: string;
+  cleanUrl: string;
+  abs: string;
+  type: 'css' | 'image' | 'font' | 'js' | 'other';
+}
+
+// Extract all url(...) and @import references from CSS or style attributes
+function extractAllFromCss(cssText: string, cssBaseUrl: string): CssUrlReference[] {
+  const list: CssUrlReference[] = [];
+  const seen = new Set<string>();
+
+  // 1. url(...) pattern
+  const urlRegex = /url\s*\(\s*([^\)]+?)\s*\)/gi;
+  let match: RegExpExecArray | null;
+  while ((match = urlRegex.exec(cssText)) !== null) {
+    const rawInner = match[1];
+    const clean = cleanCssUrlString(rawInner);
+    if (!clean || clean.startsWith('data:') || clean.startsWith('about:') || clean.startsWith('#') || clean.startsWith('blob:') || clean.startsWith('javascript:')) {
+      continue;
+    }
+    try {
+      const abs = new URL(clean, cssBaseUrl).href;
+      if (!seen.has(abs)) {
+        seen.add(abs);
+        list.push({
+          raw: rawInner,
+          cleanUrl: clean,
+          abs,
+          type: getAssetTypeFromUrl(abs)
+        });
       }
+    } catch {}
+  }
+
+  // 2. @import "..." and @import '...' pattern (without url())
+  const importRegex = /@import\s+(['"])([^'"]+?)\1/gi;
+  while ((match = importRegex.exec(cssText)) !== null) {
+    const clean = match[2].trim();
+    if (!clean || clean.startsWith('data:') || clean.startsWith('about:') || clean.startsWith('#')) continue;
+    try {
+      const abs = new URL(clean, cssBaseUrl).href;
+      if (!seen.has(abs)) {
+        seen.add(abs);
+        list.push({
+          raw: match[0],
+          cleanUrl: clean,
+          abs,
+          type: 'css'
+        });
+      }
+    } catch {}
+  }
+
+  return list;
+}
+
+// Match asset from downloadedAssetsMap with exact or fuzzy (ignoring query/hash) fallback
+function findDownloadedAsset(absUrl: string, map: Map<string, AssetItem>): AssetItem | undefined {
+  if (map.has(absUrl)) return map.get(absUrl);
+  const cleanUrl = absUrl.split('?')[0].split('#')[0];
+  if (map.has(cleanUrl)) return map.get(cleanUrl);
+  for (const [key, val] of map.entries()) {
+    if (key.split('?')[0].split('#')[0] === cleanUrl) {
+      return val;
     }
   }
-  return results;
+  return undefined;
+}
+
+// Rewrite CSS text using precise regex replacement (NEVER corrupting property names or class selectors)
+function rewriteCssText(
+  cssText: string,
+  cssBaseUrl: string,
+  cssLocalPath: string,
+  downloadedAssetsMap: Map<string, AssetItem>
+): string {
+  // A. Replace url(...)
+  let rewritten = cssText.replace(/url\s*\(\s*([^\)]+?)\s*\)/gi, (fullMatch, rawInner) => {
+    const clean = cleanCssUrlString(rawInner);
+    if (!clean || clean.startsWith('data:') || clean.startsWith('about:') || clean.startsWith('#') || clean.startsWith('blob:') || clean.startsWith('javascript:')) {
+      return fullMatch;
+    }
+    try {
+      const abs = new URL(clean, cssBaseUrl).href;
+      const matchedAsset = findDownloadedAsset(abs, downloadedAssetsMap);
+      if (matchedAsset) {
+        const relPath = getRelativePath(cssLocalPath, matchedAsset.path);
+        return `url("${relPath}")`;
+      } else {
+        // Fallback: If not downloaded, turn relative to absolute online URL so it won't break with local 404 (file:///C:/...)
+        if (!clean.startsWith('http://') && !clean.startsWith('https://') && !clean.startsWith('//')) {
+          return `url("${abs}")`;
+        }
+      }
+    } catch {}
+    return fullMatch;
+  });
+
+  // B. Replace @import "..."
+  rewritten = rewritten.replace(/@import\s+(['"])([^'"]+?)\1/gi, (fullMatch, quote, importUrl) => {
+    const clean = importUrl.trim();
+    try {
+      const abs = new URL(clean, cssBaseUrl).href;
+      const matchedAsset = findDownloadedAsset(abs, downloadedAssetsMap);
+      if (matchedAsset) {
+        const relPath = getRelativePath(cssLocalPath, matchedAsset.path);
+        return `@import "${relPath}"`;
+      } else {
+        if (!clean.startsWith('http://') && !clean.startsWith('https://') && !clean.startsWith('//')) {
+          return `@import "${abs}"`;
+        }
+      }
+    } catch {}
+    return fullMatch;
+  });
+
+  return rewritten;
 }
 
 // Concurrency helper for high-speed parallel fetching with error isolation
@@ -634,20 +759,17 @@ export async function processWebsiteCloning(options: CloneOptions): Promise<Clon
       $('[style]').each((_, el) => {
         const styleText = $(el).attr('style');
         if (styleText && styleText.toLowerCase().includes('url(')) {
-          const bgUrls = extractUrlsFromCssText(styleText, pageBaseUrl);
-          bgUrls.forEach(u => addAssetToDownload(u.abs, 'image'));
+          const bgUrls = extractAllFromCss(styleText, pageBaseUrl);
+          bgUrls.forEach(u => addAssetToDownload(u.abs, u.type));
         }
       });
 
       // E. Embedded <style> tags
       $('style').each((_, el) => {
         const cssContent = $(el).html();
-        if (cssContent && cssContent.toLowerCase().includes('url(')) {
-          const styleUrls = extractUrlsFromCssText(cssContent, pageBaseUrl);
-          styleUrls.forEach(u => {
-            const isFont = u.abs.endsWith('.woff2') || u.abs.endsWith('.woff') || u.abs.endsWith('.ttf') || u.abs.endsWith('.eot');
-            addAssetToDownload(u.abs, isFont ? 'font' : 'image');
-          });
+        if (cssContent && (cssContent.toLowerCase().includes('url(') || cssContent.includes('@import'))) {
+          const styleUrls = extractAllFromCss(cssContent, pageBaseUrl);
+          styleUrls.forEach(u => addAssetToDownload(u.abs, u.type));
         }
       });
     }
@@ -676,18 +798,21 @@ export async function processWebsiteCloning(options: CloneOptions): Promise<Clon
     try {
       const u = new URL(urlStr);
       const pathname = u.pathname;
-      const ext = pathname.split('.').pop() || '';
-      const cleanExt = /^[a-zA-Z0-9]{1,5}$/.test(ext) ? ext : '';
+      const rawExt = (pathname.split('.').pop() || '').toLowerCase();
+      const cleanExt = /^[a-z0-9]{2,5}$/.test(rawExt) && !['php', 'jsp', 'asp', 'aspx', 'do', 'action', 'cgi', 'html', 'htm'].includes(rawExt) ? rawExt : '';
 
       if (type === 'css') return `css/style_${cssIdx++}.${cleanExt || 'css'}`;
       if (type === 'js') return `js/script_${jsIdx++}.${cleanExt || 'js'}`;
       if (type === 'image') {
         let guessedExt = cleanExt;
         if (!guessedExt) {
-          if (urlStr.includes('.png')) guessedExt = 'png';
-          else if (urlStr.includes('.svg')) guessedExt = 'svg';
-          else if (urlStr.includes('.webp')) guessedExt = 'webp';
-          else if (urlStr.includes('.gif')) guessedExt = 'gif';
+          const lowerUrl = urlStr.toLowerCase();
+          if (lowerUrl.includes('.png')) guessedExt = 'png';
+          else if (lowerUrl.includes('.svg')) guessedExt = 'svg';
+          else if (lowerUrl.includes('.webp')) guessedExt = 'webp';
+          else if (lowerUrl.includes('.gif')) guessedExt = 'gif';
+          else if (lowerUrl.includes('.ico')) guessedExt = 'ico';
+          else if (lowerUrl.includes('.avif')) guessedExt = 'avif';
           else guessedExt = 'jpg';
         }
         return `images/img_${imgIdx++}.${guessedExt}`;
@@ -703,7 +828,7 @@ export async function processWebsiteCloning(options: CloneOptions): Promise<Clon
     const assetsList = Array.from(assetsToDownloadMap.values());
     addLog('info', `正在以 12 线程并发下载 ${assetsList.length} 个静态资源...`);
 
-    // Download static assets concurrently
+    // Download initial static assets concurrently
     await runWithConcurrency(assetsList, 12, async (item) => {
       if (Date.now() >= globalDeadline) return;
       const localAssetPath = getLocalAssetPath(item.url, item.type);
@@ -712,7 +837,11 @@ export async function processWebsiteCloning(options: CloneOptions): Promise<Clon
         const controller = new AbortController();
         const timeout = setTimeout(() => controller.abort(), 6000);
         const res = await fetch(item.url, {
-          headers: { 'User-Agent': selectedUserAgent, 'Referer': baseUrl.href },
+          headers: {
+            'User-Agent': selectedUserAgent,
+            'Referer': baseUrl.href,
+            'Accept': item.type === 'image' ? 'image/avif,image/webp,image/apng,image/svg+xml,image/*,*/*;q=0.8' : '*/*'
+          },
           signal: controller.signal,
         });
         clearTimeout(timeout);
@@ -763,71 +892,102 @@ export async function processWebsiteCloning(options: CloneOptions): Promise<Clon
       }
     });
 
-    // Inspect CSS files and download any embedded background images or fonts
-    const cssAssets = Array.from(downloadedAssetsMap.entries()).filter(
+    // Multi-pass CSS dependency resolution (supports nested @import and background images up to 3 levels deep)
+    let pendingCssAssets = Array.from(downloadedAssetsMap.entries()).filter(
       ([_, assetInfo]) => assetInfo.type === 'css' && assetInfo.status === 'success'
     );
 
-    for (const [origUrl, assetInfo] of cssAssets) {
-      if (Date.now() >= globalDeadline) break;
+    let cssDepth = 0;
+    while (pendingCssAssets.length > 0 && cssDepth < 3 && Date.now() < globalDeadline) {
+      cssDepth++;
+      const nextRoundAssets: { url: string; type: 'css' | 'image' | 'font' | 'js' | 'other'; origCssUrl: string }[] = [];
 
-      const cssBuffer = assetContentMap.get(assetInfo.path);
-      if (!cssBuffer) continue;
+      for (const [origUrl, assetInfo] of pendingCssAssets) {
+        const cssBuffer = assetContentMap.get(assetInfo.path);
+        if (!cssBuffer) continue;
 
-      let cssText = cssBuffer.toString('utf-8');
-      const embeddedUrls = extractUrlsFromCssText(cssText, origUrl);
+        const cssText = cssBuffer.toString('utf-8');
+        const embeddedRefs = extractAllFromCss(cssText, origUrl);
 
-      // Download embedded background images / fonts concurrently
-      await runWithConcurrency(embeddedUrls, 8, async (emb) => {
-        if (!downloadedAssetsMap.has(emb.abs) && Date.now() < globalDeadline) {
-          const isFont = emb.abs.endsWith('.woff2') || emb.abs.endsWith('.woff') || emb.abs.endsWith('.ttf') || emb.abs.endsWith('.eot');
-          const assetType = isFont ? 'font' : 'image';
-          const embLocalPath = getLocalAssetPath(emb.abs, assetType);
-
-          try {
-            const controller = new AbortController();
-            const timeout = setTimeout(() => controller.abort(), 5000);
-            const res = await fetch(emb.abs, {
-              headers: { 'User-Agent': selectedUserAgent, 'Referer': origUrl },
-              signal: controller.signal,
+        for (const ref of embeddedRefs) {
+          if (!downloadedAssetsMap.has(ref.abs) && !assetsToDownloadMap.has(ref.abs)) {
+            nextRoundAssets.push({
+              url: ref.abs,
+              type: ref.type,
+              origCssUrl: origUrl
             });
-            clearTimeout(timeout);
-
-            if (res.ok) {
-              const buf = Buffer.from(await res.arrayBuffer());
-              if (assetType === 'image') imageCount++; else fontCount++;
-              totalAssetsSize += buf.byteLength;
-
-              const embAssetInfo: AssetItem = {
-                path: embLocalPath,
-                originalUrl: emb.abs,
-                type: assetType,
-                size: buf.byteLength,
-                status: 'success',
-                mimeType: res.headers.get('content-type') || 'application/octet-stream',
-              };
-
-              downloadedAssetsMap.set(emb.abs, embAssetInfo);
-              assetContentMap.set(embLocalPath, buf);
-              assetItemsList.push(embAssetInfo);
-            }
-          } catch {
-            // Ignore individual background image download failure
           }
-        }
-      });
-
-      // Rewrite CSS url reference to local relative path
-      for (const emb of embeddedUrls) {
-        if (downloadedAssetsMap.has(emb.abs)) {
-          const targetAsset = downloadedAssetsMap.get(emb.abs)!;
-          const relPathInCss = getRelativePath(assetInfo.path, targetAsset.path);
-          cssText = cssText.split(emb.raw).join(relPathInCss);
         }
       }
 
-      // Save updated CSS buffer
-      assetContentMap.set(assetInfo.path, Buffer.from(cssText, 'utf-8'));
+      if (nextRoundAssets.length === 0) break;
+
+      addLog('info', `第 ${cssDepth} 轮 CSS 深度分析: 发现 ${nextRoundAssets.length} 个嵌套背景图/字体/@import 资源...`);
+
+      const newDownloadedCss: [string, AssetItem][] = [];
+
+      await runWithConcurrency(nextRoundAssets, 10, async (item) => {
+        if (Date.now() >= globalDeadline) return;
+        const localAssetPath = getLocalAssetPath(item.url, item.type);
+
+        try {
+          const controller = new AbortController();
+          const timeout = setTimeout(() => controller.abort(), 6000);
+          const res = await fetch(item.url, {
+            headers: {
+              'User-Agent': selectedUserAgent,
+              'Referer': item.origCssUrl || baseUrl.href,
+              'Accept': item.type === 'image' ? 'image/avif,image/webp,image/apng,image/svg+xml,image/*,*/*;q=0.8' : '*/*'
+            },
+            signal: controller.signal,
+          });
+          clearTimeout(timeout);
+
+          if (res.ok) {
+            const buf = Buffer.from(await res.arrayBuffer());
+            const mime = res.headers.get('content-type') || 'application/octet-stream';
+
+            if (item.type === 'css') cssCount++;
+            else if (item.type === 'image') imageCount++;
+            else if (item.type === 'font') fontCount++;
+
+            totalAssetsSize += buf.byteLength;
+
+            const assetInfo: AssetItem = {
+              path: localAssetPath,
+              originalUrl: item.url,
+              type: item.type,
+              size: buf.byteLength,
+              status: 'success',
+              mimeType: mime,
+            };
+
+            downloadedAssetsMap.set(item.url, assetInfo);
+            assetContentMap.set(localAssetPath, buf);
+            assetItemsList.push(assetInfo);
+
+            if (item.type === 'css') {
+              newDownloadedCss.push([item.url, assetInfo]);
+            }
+          }
+        } catch {
+          // Ignore individual background image download failure
+        }
+      });
+
+      pendingCssAssets = newDownloadedCss;
+    }
+
+    // Rewrite ALL CSS files with precise regex URL replacement (never corrupting syntax)
+    for (const [origUrl, assetInfo] of Array.from(downloadedAssetsMap.entries())) {
+      if (assetInfo.type === 'css' && assetInfo.status === 'success') {
+        const cssBuffer = assetContentMap.get(assetInfo.path);
+        if (!cssBuffer) continue;
+
+        const cssText = cssBuffer.toString('utf-8');
+        const rewrittenCss = rewriteCssText(cssText, origUrl, assetInfo.path, downloadedAssetsMap);
+        assetContentMap.set(assetInfo.path, Buffer.from(rewrittenCss, 'utf-8'));
+      }
     }
 
     // Add all asset buffers to zip
@@ -846,11 +1006,13 @@ export async function processWebsiteCloning(options: CloneOptions): Promise<Clon
     $('link[rel="stylesheet"]').each((_, el) => {
       const href = $(el).attr('href');
       const abs = toAbsoluteUrl(href, pageBaseUrl);
-      if (abs && downloadedAssetsMap.has(abs)) {
-        const assetObj = downloadedAssetsMap.get(abs)!;
-        $(el).attr('href', getRelativePath(pageLocalPath, assetObj.path));
-      } else if (abs) {
-        $(el).attr('href', abs);
+      if (abs) {
+        const assetObj = findDownloadedAsset(abs, downloadedAssetsMap);
+        if (assetObj) {
+          $(el).attr('href', getRelativePath(pageLocalPath, assetObj.path));
+        } else {
+          $(el).attr('href', abs);
+        }
       }
     });
 
@@ -858,11 +1020,13 @@ export async function processWebsiteCloning(options: CloneOptions): Promise<Clon
     $('script[src]').each((_, el) => {
       const src = $(el).attr('src');
       const abs = toAbsoluteUrl(src, pageBaseUrl);
-      if (abs && downloadedAssetsMap.has(abs)) {
-        const assetObj = downloadedAssetsMap.get(abs)!;
-        $(el).attr('src', getRelativePath(pageLocalPath, assetObj.path));
-      } else if (abs) {
-        $(el).attr('src', abs);
+      if (abs) {
+        const assetObj = findDownloadedAsset(abs, downloadedAssetsMap);
+        if (assetObj) {
+          $(el).attr('src', getRelativePath(pageLocalPath, assetObj.path));
+        } else {
+          $(el).attr('src', abs);
+        }
       }
     });
 
@@ -883,9 +1047,12 @@ export async function processWebsiteCloning(options: CloneOptions): Promise<Clon
       let matchedLocalPath: string | null = null;
       for (const cand of candidates) {
         const abs = toAbsoluteUrl(cand, pageBaseUrl);
-        if (abs && downloadedAssetsMap.has(abs)) {
-          matchedLocalPath = downloadedAssetsMap.get(abs)!.path;
-          break;
+        if (abs) {
+          const matched = findDownloadedAsset(abs, downloadedAssetsMap);
+          if (matched) {
+            matchedLocalPath = matched.path;
+            break;
+          }
         }
       }
 
@@ -911,9 +1078,12 @@ export async function processWebsiteCloning(options: CloneOptions): Promise<Clon
       if (srcset) {
         const firstUrl = srcset.trim().split(/\s+/)[0];
         const abs = toAbsoluteUrl(firstUrl, pageBaseUrl);
-        if (abs && downloadedAssetsMap.has(abs)) {
-          const relPath = getRelativePath(pageLocalPath, downloadedAssetsMap.get(abs)!.path);
-          $(el).attr('srcset', relPath);
+        if (abs) {
+          const matched = findDownloadedAsset(abs, downloadedAssetsMap);
+          if (matched) {
+            const relPath = getRelativePath(pageLocalPath, matched.path);
+            $(el).attr('srcset', relPath);
+          }
         }
       }
     });
@@ -922,38 +1092,29 @@ export async function processWebsiteCloning(options: CloneOptions): Promise<Clon
     $('link[rel*="icon"]').each((_, el) => {
       const href = $(el).attr('href');
       const abs = toAbsoluteUrl(href, pageBaseUrl);
-      if (abs && downloadedAssetsMap.has(abs)) {
-        $(el).attr('href', getRelativePath(pageLocalPath, downloadedAssetsMap.get(abs)!.path));
+      if (abs) {
+        const matched = findDownloadedAsset(abs, downloadedAssetsMap);
+        if (matched) {
+          $(el).attr('href', getRelativePath(pageLocalPath, matched.path));
+        }
       }
     });
 
     // Inline style background-image
     $('[style]').each((_, el) => {
-      let styleText = $(el).attr('style') || '';
-      if (styleText.toLowerCase().includes('url(')) {
-        const urls = extractUrlsFromCssText(styleText, pageBaseUrl);
-        urls.forEach(u => {
-          if (downloadedAssetsMap.has(u.abs)) {
-            const relPath = getRelativePath(pageLocalPath, downloadedAssetsMap.get(u.abs)!.path);
-            styleText = styleText.split(u.raw).join(relPath);
-          }
-        });
-        $(el).attr('style', styleText);
+      const styleText = $(el).attr('style');
+      if (styleText && styleText.toLowerCase().includes('url(')) {
+        const rewrittenStyle = rewriteCssText(styleText, pageBaseUrl, pageLocalPath, downloadedAssetsMap);
+        $(el).attr('style', rewrittenStyle);
       }
     });
 
     // Embedded <style> tags
     $('style').each((_, el) => {
-      let cssText = $(el).html() || '';
-      if (cssText.toLowerCase().includes('url(')) {
-        const urls = extractUrlsFromCssText(cssText, pageBaseUrl);
-        urls.forEach(u => {
-          if (downloadedAssetsMap.has(u.abs)) {
-            const relPath = getRelativePath(pageLocalPath, downloadedAssetsMap.get(u.abs)!.path);
-            cssText = cssText.split(u.raw).join(relPath);
-          }
-        });
-        $(el).html(cssText);
+      const cssText = $(el).html();
+      if (cssText && (cssText.toLowerCase().includes('url(') || cssText.includes('@import'))) {
+        const rewrittenCss = rewriteCssText(cssText, pageBaseUrl, pageLocalPath, downloadedAssetsMap);
+        $(el).html(rewrittenCss);
       }
     });
 
@@ -961,24 +1122,47 @@ export async function processWebsiteCloning(options: CloneOptions): Promise<Clon
     $('a[href], a[data-href], a[data-url], area[href]').each((_, el) => {
       const $a = $(el);
       const rawHref = $a.attr('href') || $a.attr('data-href') || $a.attr('data-url');
-      if (!rawHref || rawHref.startsWith('javascript:') || rawHref.startsWith('mailto:') || rawHref.startsWith('tel:') || rawHref.startsWith('#')) {
+      if (!rawHref || rawHref.startsWith('javascript:') || rawHref.startsWith('mailto:') || rawHref.startsWith('tel:')) {
+        return;
+      }
+
+      // If it's a pure in-page hash like href="#section" or href="#", keep it directly
+      if (rawHref.startsWith('#')) {
         return;
       }
 
       try {
-        const absUrl = new URL(rawHref, pageBaseUrl).href;
-        const normUrl = normalizePageUrl(absUrl);
+        const parsed = new URL(rawHref, pageBaseUrl);
+        const currentBaseParsed = new URL(pageBaseUrl);
+        const hash = parsed.hash || '';
+        const normUrl = normalizePageUrl(parsed.href);
 
         const targetPageObj = findDownloadedPage(normUrl);
 
         if (targetPageObj) {
-          // Point to downloaded offline subpage!
-          const relativePageLink = getRelativePath(pageLocalPath, targetPageObj.localPath);
-          $a.attr('href', relativePageLink);
+          if (pageLocalPath === targetPageObj.localPath) {
+            // Same page anchor or home link
+            if (hash) {
+              $a.attr('href', hash);
+            } else {
+              const selfFileName = targetPageObj.localPath.split('/').pop() || 'index.html';
+              $a.attr('href', './' + selfFileName);
+            }
+          } else {
+            // Point to downloaded offline subpage!
+            const relativePageLink = getRelativePath(pageLocalPath, targetPageObj.localPath);
+            $a.attr('href', relativePageLink + hash);
+          }
         } else {
-          // Link was not downloaded (exceeded maxPages limit or external)
-          $a.attr('href', absUrl);
-          $a.attr('target', '_blank');
+          // If on single page mode, check if link was pointing to a hash on current page
+          if (parsed.origin === currentBaseParsed.origin && (parsed.pathname === currentBaseParsed.pathname || parsed.pathname === '/' || parsed.pathname === '') && hash) {
+            $a.attr('href', hash);
+          } else {
+            // Link was not downloaded (exceeded maxPages limit or external)
+            $a.attr('href', parsed.href);
+            $a.attr('target', '_blank');
+            $a.attr('rel', 'noopener noreferrer');
+          }
         }
       } catch {
         // Keep original

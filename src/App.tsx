@@ -118,9 +118,10 @@ export default function App() {
       timestamp: historyItem.timestamp,
       mode: historyItem.mode,
       stats: {
-        htmlSize: Buffer.byteLength(historyItem.processedHtml || '', 'utf-8'),
+        htmlSize: new TextEncoder().encode(historyItem.processedHtml || '').length,
         totalAssetsSize: historyItem.totalSize,
         assetCount: historyItem.assetCount,
+        pagesCount: historyItem.pagesCount || 1,
         cssCount: 0,
         jsCount: 0,
         imageCount: 0,

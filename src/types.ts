@@ -80,6 +80,7 @@ export interface SiteHistoryItem {
   mode: CloneMode;
   totalSize: number;
   assetCount: number;
+  pagesCount?: number;
   processedHtml: string;
   zipBase64?: string;
   standaloneHtml: string;

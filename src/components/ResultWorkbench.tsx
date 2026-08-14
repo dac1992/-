@@ -1,4 +1,5 @@
-import React, { useState } from 'react';
+import React, { useState, useEffect, useCallback, useRef } from 'react';
+import JSZip from 'jszip';
 import {
   Monitor,
   Tablet,
@@ -19,7 +20,13 @@ import {
   Layers,
   Sparkles,
   Info,
-  CheckCircle2
+  CheckCircle2,
+  Loader2,
+  ChevronLeft,
+  ChevronRight,
+  Home,
+  AlertCircle,
+  X
 } from 'lucide-react';
 import { CloneResult, AssetItem } from '../types';
 
@@ -27,14 +34,367 @@ interface ResultWorkbenchProps {
   result: CloneResult;
 }
 
+interface HtmlPageItem {
+  path: string;
+  title: string;
+}
+
 export const ResultWorkbench: React.FC<ResultWorkbenchProps> = ({ result }) => {
   const [activeTab, setActiveTab] = useState<'preview' | 'assets' | 'code' | 'stats'>('preview');
   const [device, setDevice] = useState<'desktop' | 'tablet' | 'mobile'>('desktop');
   const [isFullscreen, setIsFullscreen] = useState(false);
   const [iframeKey, setIframeKey] = useState(0);
+  const [previewMode, setPreviewMode] = useState<'processed' | 'standalone'>('processed');
   const [codeType, setCodeType] = useState<'processed' | 'standalone'>('processed');
   const [copied, setCopied] = useState(false);
   const [selectedAsset, setSelectedAsset] = useState<AssetItem | null>(null);
+
+  // Subpage navigation and history state
+  const [currentPath, setCurrentPath] = useState<string>('index.html');
+  const [navHistory, setNavHistory] = useState<string[]>(['index.html']);
+  const [historyIndex, setHistoryIndex] = useState<number>(0);
+  const [availablePages, setAvailablePages] = useState<HtmlPageItem[]>([]);
+  const [navToast, setNavToast] = useState<{ message: string; targetUrl?: string } | null>(null);
+
+  // In-memory offline unpacked HTML with local blob URLs
+  const [offlineHtmlWithBlobs, setOfflineHtmlWithBlobs] = useState<string>('');
+  const [isPreparingOffline, setIsPreparingOffline] = useState(false);
+  const [unpackedCount, setUnpackedCount] = useState({ css: 0, images: 0, pages: 1 });
+
+  const zipInstanceRef = useRef<JSZip | null>(null);
+  const blobUrlsRef = useRef<string[]>([]);
+  const assetBlobMapRef = useRef<Record<string, string>>({});
+  const cssContentMapRef = useRef<Record<string, string>>({});
+
+  // Helper to normalize path lookup inside ZIP
+  const findFileInZip = useCallback((zip: JSZip, targetPath: string) => {
+    const clean = targetPath.replace(/^\.\//, '').replace(/^\//, '');
+    if (zip.file(clean)) return zip.file(clean);
+    for (const [name, file] of Object.entries(zip.files)) {
+      if (name.toLowerCase() === clean.toLowerCase() || name.endsWith('/' + clean) || clean.endsWith('/' + name)) {
+        return file;
+      }
+    }
+    return null;
+  }, []);
+
+  // Build rendered HTML for a specific page using unpacked blobs
+  const renderPageHtml = useCallback(async (zip: JSZip, pagePath: string) => {
+    const file = findFileInZip(zip, pagePath);
+    let htmlText = file ? await file.async('text') : result.processedHtml;
+
+    const cleanCurrent = pagePath.replace(/^\.\//, '');
+
+    // 1. Replace stylesheet link tags with inlined <style> containing the blob-mapped CSS
+    for (const [cssPath, cssContent] of Object.entries(cssContentMapRef.current)) {
+      const cleanCss = cssPath.replace(/^\.\//, '');
+      const linkPattern = new RegExp(`<link[^>]+href=["'][^"']*${cleanCss.replace(/[.*+?^${}()|[\]\\]/g, '\\$&')}["'][^>]*>`, 'gi');
+      htmlText = htmlText.replace(linkPattern, `<style data-source="${cleanCss}">\n${cssContent}\n</style>`);
+    }
+
+    // 2. Replace asset references in HTML (images, scripts, inline styles)
+    for (const [assetPath, blobUrl] of Object.entries(assetBlobMapRef.current)) {
+      if (assetPath.startsWith('./') || assetPath.startsWith('/')) continue;
+      const simpleName = assetPath;
+      htmlText = htmlText.split(`"${simpleName}"`).join(`"${blobUrl}"`);
+      htmlText = htmlText.split(`'${simpleName}'`).join(`'${blobUrl}'`);
+      htmlText = htmlText.split(`"./${simpleName}"`).join(`"${blobUrl}"`);
+      htmlText = htmlText.split(`'./${simpleName}'`).join(`'${blobUrl}'`);
+      htmlText = htmlText.split(`"../${simpleName}"`).join(`"${blobUrl}"`);
+      htmlText = htmlText.split(`'../${simpleName}'`).join(`'${blobUrl}'`);
+    }
+
+    // 3. Inject interactive navigation bridge script
+    const navScript = `
+<script id="__offline_interactive_nav_bridge">
+(function() {
+  window.__CLONER_PAGE_PATH = "${cleanCurrent}";
+  
+  document.addEventListener('click', function(e) {
+    var a = e.target.closest('a');
+    if (!a) return;
+    var href = a.getAttribute('href');
+    if (!href || href === '#' || href.startsWith('javascript:') || href.startsWith('mailto:') || href.startsWith('tel:')) {
+      return;
+    }
+
+    // 1. Handle in-page Anchor jumps (#section)
+    if (href.startsWith('#')) {
+      var targetId = href.substring(1);
+      var targetEl = document.getElementById(targetId) || document.querySelector('[name="' + targetId + '"]');
+      if (targetEl) {
+        e.preventDefault();
+        targetEl.scrollIntoView({ behavior: 'smooth', block: 'start' });
+      }
+      return;
+    }
+
+    // 2. Handle local relative subpage links
+    if (!href.startsWith('http://') && !href.startsWith('https://') && !href.startsWith('//') && !href.startsWith('blob:')) {
+      e.preventDefault();
+      window.parent.postMessage({
+        type: 'CLONER_NAVIGATE',
+        href: href,
+        currentPath: window.__CLONER_PAGE_PATH
+      }, '*');
+      return;
+    }
+
+    // 3. Handle absolute / external links
+    if (href.startsWith('http://') || href.startsWith('https://') || href.startsWith('//')) {
+      a.setAttribute('target', '_blank');
+      a.setAttribute('rel', 'noopener noreferrer');
+    }
+  }, true);
+})();
+</script>
+`;
+
+    if (htmlText.includes('</body>')) {
+      htmlText = htmlText.replace('</body>', navScript + '\n</body>');
+    } else {
+      htmlText += navScript;
+    }
+
+    return htmlText;
+  }, [findFileInZip, result.processedHtml]);
+
+  // Initial Unpack of ZIP archive
+  useEffect(() => {
+    let isMounted = true;
+
+    async function prepareOfflinePreview() {
+      if (!result.zipBase64) {
+        setOfflineHtmlWithBlobs(result.processedHtml);
+        return;
+      }
+
+      setIsPreparingOffline(true);
+      try {
+        // Clean up previous blob URLs
+        blobUrlsRef.current.forEach(url => URL.revokeObjectURL(url));
+        blobUrlsRef.current = [];
+
+        const zip = await JSZip.loadAsync(result.zipBase64, { base64: true });
+        zipInstanceRef.current = zip;
+
+        const assetBlobMap: Record<string, string> = {};
+        let imgCount = 0;
+        let styleCount = 0;
+
+        // Step 1: Discover all HTML pages inside ZIP
+        const foundPages: HtmlPageItem[] = [];
+        for (const [filePath, file] of Object.entries(zip.files)) {
+          if (!file.dir && filePath.endsWith('.html')) {
+            let pageTitle = filePath;
+            if (filePath === 'index.html') {
+              pageTitle = result.title ? `首页 (${result.title.substring(0, 16)})` : '首页 (index.html)';
+            } else if (result.subpages) {
+              const matchedSub = result.subpages.find(s => s.localPath === filePath);
+              if (matchedSub && matchedSub.title) {
+                pageTitle = `${matchedSub.title.substring(0, 16)} (${filePath})`;
+              }
+            }
+            foundPages.push({ path: filePath, title: pageTitle });
+          }
+        }
+        foundPages.sort((a, b) => (a.path === 'index.html' ? -1 : b.path === 'index.html' ? 1 : a.path.localeCompare(b.path)));
+
+        // Step 2: Extract all binary assets (images, fonts, scripts)
+        for (const [filePath, file] of Object.entries(zip.files)) {
+          if (file.dir || filePath.endsWith('.html') || filePath.endsWith('.css') || filePath.endsWith('.txt')) {
+            continue;
+          }
+          const ab = await file.async('arraybuffer');
+          let mime = 'application/octet-stream';
+          const lower = filePath.toLowerCase();
+          if (lower.endsWith('.png')) mime = 'image/png';
+          else if (lower.endsWith('.jpg') || lower.endsWith('.jpeg')) mime = 'image/jpeg';
+          else if (lower.endsWith('.gif')) mime = 'image/gif';
+          else if (lower.endsWith('.svg')) mime = 'image/svg+xml';
+          else if (lower.endsWith('.webp')) mime = 'image/webp';
+          else if (lower.endsWith('.ico')) mime = 'image/x-icon';
+          else if (lower.endsWith('.avif')) mime = 'image/avif';
+          else if (lower.endsWith('.woff2')) mime = 'font/woff2';
+          else if (lower.endsWith('.woff')) mime = 'font/woff';
+          else if (lower.endsWith('.ttf')) mime = 'font/ttf';
+          else if (lower.endsWith('.js')) mime = 'application/javascript';
+
+          if (mime.startsWith('image/')) imgCount++;
+
+          const blob = new Blob([ab], { type: mime });
+          const blobUrl = URL.createObjectURL(blob);
+          blobUrlsRef.current.push(blobUrl);
+
+          assetBlobMap[filePath] = blobUrl;
+          assetBlobMap['./' + filePath] = blobUrl;
+          assetBlobMap['/' + filePath] = blobUrl;
+        }
+
+        assetBlobMapRef.current = assetBlobMap;
+
+        // Step 3: Extract & rewrite all CSS files with blob URLs
+        const cssContentMap: Record<string, string> = {};
+        for (const [filePath, file] of Object.entries(zip.files)) {
+          if (file.dir || !filePath.endsWith('.css')) continue;
+          styleCount++;
+          let cssText = await file.async('text');
+
+          for (const [assetPath, blobUrl] of Object.entries(assetBlobMap)) {
+            if (assetPath.startsWith('./') || assetPath.startsWith('/')) continue;
+            const simpleName = assetPath;
+            const relFromCss = '../' + simpleName;
+
+            cssText = cssText.split(`url("${relFromCss}")`).join(`url("${blobUrl}")`);
+            cssText = cssText.split(`url('${relFromCss}')`).join(`url('${blobUrl}')`);
+            cssText = cssText.split(`url(${relFromCss})`).join(`url("${blobUrl}")`);
+            cssText = cssText.split(`"${relFromCss}"`).join(`"${blobUrl}"`);
+            cssText = cssText.split(`'${relFromCss}'`).join(`'${blobUrl}'`);
+
+            cssText = cssText.split(`url("${simpleName}")`).join(`url("${blobUrl}")`);
+            cssText = cssText.split(`url('${simpleName}')`).join(`url('${blobUrl}')`);
+            cssText = cssText.split(`url(${simpleName})`).join(`url("${blobUrl}")`);
+            cssText = cssText.split(`"${simpleName}"`).join(`"${blobUrl}"`);
+            cssText = cssText.split(`'${simpleName}'`).join(`'${blobUrl}'`);
+          }
+
+          cssContentMap[filePath] = cssText;
+          cssContentMap['./' + filePath] = cssText;
+        }
+
+        cssContentMapRef.current = cssContentMap;
+
+        // Step 4: Render initial home page
+        const htmlText = await renderPageHtml(zip, 'index.html');
+
+        if (isMounted) {
+          setAvailablePages(foundPages);
+          setCurrentPath('index.html');
+          setNavHistory(['index.html']);
+          setHistoryIndex(0);
+          setOfflineHtmlWithBlobs(htmlText);
+          setUnpackedCount({ css: styleCount, images: imgCount, pages: foundPages.length || 1 });
+        }
+      } catch (e) {
+        console.error('Error unpacking zip for preview:', e);
+        if (isMounted) {
+          setOfflineHtmlWithBlobs(result.processedHtml);
+        }
+      } finally {
+        if (isMounted) setIsPreparingOffline(false);
+      }
+    }
+
+    prepareOfflinePreview();
+
+    return () => {
+      isMounted = false;
+      blobUrlsRef.current.forEach(url => URL.revokeObjectURL(url));
+    };
+  }, [result.zipBase64, result.processedHtml, result.title, result.subpages, renderPageHtml]);
+
+  // Navigate to a specific page inside the ZIP
+  const navigateToPage = useCallback(async (targetPath: string, pushHistory = true) => {
+    if (!zipInstanceRef.current) return;
+    setIsPreparingOffline(true);
+    try {
+      const cleanTarget = targetPath.replace(/^\.\//, '');
+      const rendered = await renderPageHtml(zipInstanceRef.current, cleanTarget);
+      setOfflineHtmlWithBlobs(rendered);
+      setCurrentPath(cleanTarget);
+
+      if (pushHistory) {
+        setNavHistory(prev => {
+          const next = prev.slice(0, historyIndex + 1);
+          return [...next, cleanTarget];
+        });
+        setHistoryIndex(prev => prev + 1);
+      }
+    } catch (e) {
+      console.error('Error navigating page:', e);
+    } finally {
+      setIsPreparingOffline(false);
+    }
+  }, [historyIndex, renderPageHtml]);
+
+  // Listen for navigation messages from iframe
+  useEffect(() => {
+    const handleMessage = (event: MessageEvent) => {
+      if (!event.data || event.data.type !== 'CLONER_NAVIGATE') return;
+
+      const { href, currentPath: fromPath } = event.data;
+      if (!href) return;
+
+      const [rawPath] = href.split('#');
+      let targetPath = rawPath;
+
+      if (!targetPath || targetPath === './' || targetPath === '.') {
+        targetPath = fromPath;
+      } else if (targetPath.startsWith('../')) {
+        const fromDirParts = fromPath.split('/');
+        fromDirParts.pop();
+        const parts = targetPath.split('/');
+        while (parts[0] === '..') {
+          parts.shift();
+          if (fromDirParts.length > 0) fromDirParts.pop();
+        }
+        targetPath = [...fromDirParts, ...parts].join('/');
+      } else if (targetPath.startsWith('./')) {
+        const fromDirParts = fromPath.split('/');
+        fromDirParts.pop();
+        targetPath = [...fromDirParts, targetPath.substring(2)].join('/');
+      } else if (!targetPath.includes('/') && fromPath.includes('/')) {
+        const fromDirParts = fromPath.split('/');
+        fromDirParts.pop();
+        targetPath = [...fromDirParts, targetPath].join('/');
+      }
+
+      targetPath = targetPath.replace(/^\.\//, '').replace(/^\//, '');
+
+      // Check if target page exists in ZIP
+      if (zipInstanceRef.current && findFileInZip(zipInstanceRef.current, targetPath)) {
+        navigateToPage(targetPath);
+      } else {
+        // Subpage was not downloaded or is an external link
+        try {
+          const originalBase = new URL(result.finalUrl);
+          const fullFallbackUrl = new URL(href, originalBase.href).href;
+          setNavToast({
+            message: `点击的导航链接 [${targetPath || href}] 为未下载的子页面（当前为单页克隆）。您可在新标签页直接访问原站，或开启【整站克隆】下载全部内页。`,
+            targetUrl: fullFallbackUrl
+          });
+        } catch {
+          setNavToast({
+            message: `点击的导航链接 [${targetPath || href}] 为未下载的子页面。`,
+          });
+        }
+      }
+    };
+
+    window.addEventListener('message', handleMessage);
+    return () => window.removeEventListener('message', handleMessage);
+  }, [findFileInZip, navigateToPage, result.finalUrl]);
+
+  // Handle browser history back / forward
+  const handleNavBack = () => {
+    if (historyIndex > 0) {
+      const prevPath = navHistory[historyIndex - 1];
+      setHistoryIndex(historyIndex - 1);
+      navigateToPage(prevPath, false);
+    }
+  };
+
+  const handleNavForward = () => {
+    if (historyIndex < navHistory.length - 1) {
+      const nextPath = navHistory[historyIndex + 1];
+      setHistoryIndex(historyIndex + 1);
+      navigateToPage(nextPath, false);
+    }
+  };
+
+  const handleNavHome = () => {
+    navigateToPage('index.html');
+  };
 
   // Trigger download of ZIP archive
   const handleDownloadZip = () => {
@@ -78,7 +438,8 @@ export const ResultWorkbench: React.FC<ResultWorkbenchProps> = ({ result }) => {
 
   // Open in new tab
   const handleOpenNewTab = () => {
-    const blob = new Blob([result.standaloneHtml || result.processedHtml], { type: 'text/html;charset=utf-8' });
+    const contentToOpen = previewMode === 'processed' ? (offlineHtmlWithBlobs || result.processedHtml) : (result.standaloneHtml || result.processedHtml);
+    const blob = new Blob([contentToOpen], { type: 'text/html;charset=utf-8' });
     const url = URL.createObjectURL(blob);
     window.open(url, '_blank');
   };
@@ -270,60 +631,182 @@ export const ResultWorkbench: React.FC<ResultWorkbenchProps> = ({ result }) => {
               </div>
 
               <div className="flex items-center space-x-2">
+                <div className="flex items-center bg-slate-950 p-0.5 rounded-lg border border-slate-700">
+                  <button
+                    onClick={() => setPreviewMode('processed')}
+                    className={`px-3 py-1 rounded-md text-xs font-semibold transition-all flex items-center space-x-1.5 ${
+                      previewMode === 'processed'
+                        ? 'bg-emerald-600 text-white shadow-sm'
+                        : 'text-slate-400 hover:text-slate-200'
+                    }`}
+                    title="从已生成的离线 ZIP 归档包中实时装载本地样式与图片资源"
+                  >
+                    <CheckCircle2 className="w-3.5 h-3.5" />
+                    <span>本地离线真实渲染</span>
+                  </button>
+                  <button
+                    onClick={() => setPreviewMode('standalone')}
+                    className={`px-3 py-1 rounded-md text-xs font-medium transition-all ${
+                      previewMode === 'standalone'
+                        ? 'bg-indigo-600 text-white shadow-sm'
+                        : 'text-slate-400 hover:text-slate-200'
+                    }`}
+                    title="使用原站在线网络回退渲染（对照原始线上网站）"
+                  >
+                    <span>原站在网对比</span>
+                  </button>
+                </div>
+
+                {availablePages.length > 1 && (
+                  <div className="hidden sm:flex items-center space-x-1.5 bg-slate-950 border border-slate-700 px-2.5 py-1 rounded-lg text-xs">
+                    <span className="text-slate-400">页面:</span>
+                    <select
+                      value={currentPath}
+                      onChange={(e) => navigateToPage(e.target.value)}
+                      className="bg-transparent text-emerald-300 font-medium text-xs focus:outline-none cursor-pointer"
+                    >
+                      {availablePages.map(p => (
+                        <option key={p.path} value={p.path} className="bg-slate-900 text-slate-200">
+                          {p.title}
+                        </option>
+                      ))}
+                    </select>
+                  </div>
+                )}
+
                 <button
                   onClick={() => setIframeKey((prev) => prev + 1)}
                   className="px-2.5 py-1 rounded-lg bg-slate-800 hover:bg-slate-700 text-slate-300 text-xs flex items-center space-x-1"
+                  title="重新加载渲染"
                 >
                   <RefreshCw className="w-3.5 h-3.5" />
-                  <span>刷新预览</span>
+                  <span>刷新</span>
                 </button>
                 <button
                   onClick={handleOpenNewTab}
                   className="px-2.5 py-1 rounded-lg bg-slate-800 hover:bg-slate-700 text-slate-300 text-xs flex items-center space-x-1"
                 >
                   <ExternalLink className="w-3.5 h-3.5" />
-                  <span>新标签页查看</span>
+                  <span>新标签</span>
                 </button>
                 <button
                   onClick={() => setIsFullscreen(!isFullscreen)}
                   className="px-2.5 py-1 rounded-lg bg-slate-800 hover:bg-slate-700 text-slate-300 text-xs flex items-center space-x-1"
                 >
                   {isFullscreen ? <Minimize2 className="w-3.5 h-3.5" /> : <Maximize2 className="w-3.5 h-3.5" />}
-                  <span>{isFullscreen ? '退出全屏' : '全屏模式'}</span>
                 </button>
               </div>
             </div>
 
-            {/* Notification Callout */}
-            <div className="mb-4 bg-indigo-950/40 border border-indigo-800/40 p-3 rounded-xl text-xs text-indigo-200 flex items-start space-x-2">
-              <Sparkles className="w-4 h-4 text-indigo-400 shrink-0 mt-0.5" />
-              <div>
-                <span className="font-bold">真实的离线渲染效果：</span>
-                下方 Preview 框通过 Sandbox 渲染转化后的 HTML 源码。解压下载的 ZIP 压缩包后，双击 <code className="bg-slate-900 px-1 py-0.5 rounded text-indigo-300 font-mono">index.html</code> 即可得到与此完全一致的网站界面与交互样式！
+            {/* Notification Toast for Uncrawled Links */}
+            {navToast && (
+              <div className="mb-4 bg-amber-950/80 border border-amber-600/50 p-3 rounded-xl text-xs text-amber-200 flex items-start justify-between gap-3 animate-in fade-in">
+                <div className="flex items-start space-x-2">
+                  <AlertCircle className="w-4 h-4 text-amber-400 shrink-0 mt-0.5" />
+                  <div>
+                    <span className="font-bold">导航提示：</span>
+                    <span>{navToast.message}</span>
+                  </div>
+                </div>
+                <div className="flex items-center space-x-2 shrink-0">
+                  {navToast.targetUrl && (
+                    <a
+                      href={navToast.targetUrl}
+                      target="_blank"
+                      rel="noopener noreferrer"
+                      className="px-2.5 py-1 bg-amber-600 hover:bg-amber-500 text-white rounded font-medium flex items-center space-x-1"
+                    >
+                      <ExternalLink className="w-3 h-3" />
+                      <span>打开原站链接</span>
+                    </a>
+                  )}
+                  <button
+                    onClick={() => setNavToast(null)}
+                    className="p-1 text-amber-400 hover:text-amber-100 rounded"
+                  >
+                    <X className="w-3.5 h-3.5" />
+                  </button>
+                </div>
               </div>
-            </div>
+            )}
 
             {/* Iframe Viewport Container */}
             <div className={`mx-auto transition-all duration-300 ${getDeviceWidth()}`}>
               <div className="bg-slate-900 rounded-2xl border border-slate-800 shadow-2xl overflow-hidden">
-                <div className="bg-slate-800/80 px-4 py-2 border-b border-slate-700/60 flex items-center space-x-2">
-                  <div className="flex space-x-1.5">
+                {/* Browser Address Bar with Back/Forward/Home */}
+                <div className="bg-slate-800/90 px-3 py-2 border-b border-slate-700/60 flex items-center space-x-2">
+                  <div className="flex space-x-1.5 mr-1">
                     <div className="w-3 h-3 rounded-full bg-rose-500/80"></div>
                     <div className="w-3 h-3 rounded-full bg-amber-500/80"></div>
                     <div className="w-3 h-3 rounded-full bg-emerald-500/80"></div>
                   </div>
-                  <div className="flex-1 bg-slate-950/80 text-center py-1 px-3 rounded-md text-[11px] font-mono text-slate-400 truncate">
-                    file:///local_mirror/{result.title.replace(/\s+/g, '_')}/index.html
+
+                  {/* Browser Nav Buttons */}
+                  <div className="flex items-center space-x-1 bg-slate-950/60 p-0.5 rounded-md border border-slate-700/40">
+                    <button
+                      onClick={handleNavBack}
+                      disabled={historyIndex <= 0}
+                      className={`p-1 rounded text-slate-400 ${historyIndex > 0 ? 'hover:bg-slate-800 hover:text-slate-100' : 'opacity-30 cursor-not-allowed'}`}
+                      title="后退"
+                    >
+                      <ChevronLeft className="w-3.5 h-3.5" />
+                    </button>
+                    <button
+                      onClick={handleNavForward}
+                      disabled={historyIndex >= navHistory.length - 1}
+                      className={`p-1 rounded text-slate-400 ${historyIndex < navHistory.length - 1 ? 'hover:bg-slate-800 hover:text-slate-100' : 'opacity-30 cursor-not-allowed'}`}
+                      title="前进"
+                    >
+                      <ChevronRight className="w-3.5 h-3.5" />
+                    </button>
+                    <button
+                      onClick={handleNavHome}
+                      className="p-1 rounded text-slate-400 hover:bg-slate-800 hover:text-emerald-400"
+                      title="返回主页"
+                    >
+                      <Home className="w-3.5 h-3.5" />
+                    </button>
                   </div>
+
+                  {/* Address Path Display */}
+                  <div className="flex-1 bg-slate-950/80 text-left py-1 px-3 rounded-md text-[11px] font-mono text-slate-300 truncate flex items-center justify-between">
+                    <span className="truncate">
+                      {previewMode === 'standalone'
+                        ? result.finalUrl
+                        : `file:///local_mirror/${result.title.replace(/\s+/g, '_') || 'website'}/${currentPath}`}
+                    </span>
+                    {availablePages.length > 1 && (
+                      <span className="ml-2 text-[10px] px-1.5 py-0.5 bg-emerald-950/80 border border-emerald-700/50 text-emerald-300 rounded font-sans">
+                        共 {availablePages.length} 页
+                      </span>
+                    )}
+                  </div>
+
+                  {isPreparingOffline && (
+                    <div className="flex items-center space-x-1 text-[11px] text-amber-400">
+                      <Loader2 className="w-3 h-3 animate-spin" />
+                      <span>切换中...</span>
+                    </div>
+                  )}
                 </div>
 
                 <div className="relative bg-white min-h-[600px] h-[70vh]">
+                  {isPreparingOffline ? (
+                    <div className="absolute inset-0 flex flex-col items-center justify-center bg-slate-900 text-slate-300 space-y-3 z-10">
+                      <Loader2 className="w-8 h-8 text-emerald-400 animate-spin" />
+                      <p className="text-sm font-medium">正在装载页面资源...</p>
+                    </div>
+                  ) : null}
                   <iframe
-                    key={iframeKey}
+                    key={`${iframeKey}-${previewMode}-${currentPath}-${offlineHtmlWithBlobs ? 'loaded' : 'initial'}`}
                     title="Webpage Offline Preview"
-                    srcDoc={result.standaloneHtml || result.processedHtml}
+                    srcDoc={
+                      previewMode === 'processed'
+                        ? (offlineHtmlWithBlobs || result.processedHtml)
+                        : (result.standaloneHtml || result.processedHtml)
+                    }
                     className="w-full h-full border-none"
-                    sandbox="allow-scripts allow-same-origin allow-forms"
+                    sandbox="allow-scripts allow-same-origin allow-forms allow-popups allow-popups-to-escape-sandbox allow-modals allow-top-navigation-by-user-activation"
                   />
                 </div>
               </div>
